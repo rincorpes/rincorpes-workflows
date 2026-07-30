@@ -54,6 +54,12 @@ jobs:
       - name: Mark start time
         id: start
         run: echo "start_unix=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.working_directory }}/pyproject.toml
 
   lint-and-test:
     needs: [setup]
