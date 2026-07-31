@@ -1,0 +1,435 @@
+name: Reusable PyPI Release
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        required: false
+        type: string
+        default: "."
+      python_version:
+        required: false
+        type: string
+        default: "3.12"
+      package_name:
+        required: false
+        type: string
+        default: ""
+      artifact_name:
+        required: false
+        type: string
+        default: "python-package-distributions"
+      dist_directory:
+        required: false
+        type: string
+        default: "dist"
+      apt_deps:
+        required: false
+        type: string
+        default: ""
+      local_dependency_paths:
+        required: false
+        type: string
+        default: "[]"
+      build_sdist:
+        required: false
+        type: boolean
+        default: true
+      build_wheel:
+        required: false
+        type: boolean
+        default: true
+      verify_metadata:
+        required: false
+        type: boolean
+        default: true
+      verify_install:
+        required: false
+        type: boolean
+        default: true
+      publish:
+        required: false
+        type: boolean
+        default: true
+      repository_url:
+        required: false
+        type: string
+        default: ""
+      skip_existing:
+        required: false
+        type: boolean
+        default: false
+      tag_prefix:
+        required: false
+        type: string
+        default: "v"
+      tag_name:
+        required: false
+        type: string
+        default: ""
+      verify_tag_matches_version:
+        required: false
+        type: boolean
+        default: false
+      create_github_release:
+        required: false
+        type: boolean
+        default: false
+      github_release_name:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      PACKAGE_INDEX_API_TOKEN:
+        required: false
+    outputs:
+      package_name:
+        description: Resolved package name from input or pyproject metadata.
+        value: ${{ jobs.build.outputs.package_name }}
+      version:
+        description: Resolved package version from pyproject metadata.
+        value: ${{ jobs.build.outputs.version }}
+      tag_name:
+        description: Resolved release tag name.
+        value: ${{ jobs.build.outputs.tag_name }}
+      release_ref:
+        description: Git commit SHA used for the release build.
+        value: ${{ jobs.build.outputs.release_ref }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-release-${{ github.repository }}-${{ inputs.working_directory }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      package_name: ${{ steps.metadata.outputs.package_name }}
+      version: ${{ steps.metadata.outputs.version }}
+      tag_name: ${{ steps.metadata.outputs.tag_name }}
+      release_ref: ${{ steps.metadata.outputs.release_ref }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install system dependencies (apt)
+        if: ${{ inputs.apt_deps != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ inputs.apt_deps }}
+
+      - name: Set up Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.working_directory }}/pyproject.toml
+
+      - name: Install local sibling dependencies
+        env:
+          LOCAL_DEPENDENCY_PATHS: ${{ inputs.local_dependency_paths }}
+        run: |
+          python -m pip install --upgrade pip
+          python - << 'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          dep_paths = json.loads(os.environ["LOCAL_DEPENDENCY_PATHS"])
+          for dep_path in dep_paths:
+              resolved_path = os.path.abspath(
+                  os.path.expandvars(os.path.expanduser(dep_path))
+              )
+              if not os.path.exists(resolved_path):
+                  raise FileNotFoundError(
+                      f"Local dependency path does not exist: {dep_path} -> "
+                      f"{resolved_path}"
+                  )
+              print(f"Installing local dependency: {resolved_path}")
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "-e", resolved_path],
+                  check=True,
+              )
+          PY
+
+      - name: Resolve package metadata
+        id: metadata
+        env:
+          PACKAGE_NAME_OVERRIDE: ${{ inputs.package_name }}
+          TAG_NAME_OVERRIDE: ${{ inputs.tag_name }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          python - << 'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          try:
+              import tomllib
+          except ModuleNotFoundError:  # pragma: no cover
+              import tomli as tomllib  # type: ignore
+
+          pyproject_path = Path("pyproject.toml")
+          if not pyproject_path.exists():
+              raise SystemExit(
+                  f"pyproject.toml not found in {Path.cwd()}"
+              )
+
+          data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+          project = data.get("project", {})
+          poetry = data.get("tool", {}).get("poetry", {})
+
+          package_name = (
+              os.environ["PACKAGE_NAME_OVERRIDE"].strip()
+              or str(project.get("name") or poetry.get("name") or "").strip()
+          )
+          version = str(
+              project.get("version") or poetry.get("version") or ""
+          ).strip()
+
+          if not package_name:
+              raise SystemExit(
+                  "Unable to resolve package name. Set the workflow "
+                  "input 'package_name' or declare project metadata."
+              )
+
+          if not version:
+              raise SystemExit(
+                  "Unable to resolve package version from pyproject metadata."
+              )
+
+          tag_name = (
+              os.environ["TAG_NAME_OVERRIDE"].strip()
+              or f'{os.environ["TAG_PREFIX"]}{version}'
+          )
+          release_ref = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"],
+              text=True,
+          ).strip()
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as output_file:
+              output_file.write(f"package_name={package_name}\n")
+              output_file.write(f"version={version}\n")
+              output_file.write(f"tag_name={tag_name}\n")
+              output_file.write(f"release_ref={release_ref}\n")
+          PY
+
+      - name: Verify tag matches version
+        if: ${{ inputs.verify_tag_matches_version }}
+        env:
+          EXPECTED_TAG: ${{ steps.metadata.outputs.tag_name }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::Expected a tag ref for this release, got '$GITHUB_REF_TYPE'."
+            exit 1
+          fi
+
+          if [ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' does not match expected package tag '$EXPECTED_TAG'."
+            exit 1
+          fi
+
+      - name: Install release tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Build distributions
+        env:
+          BUILD_SDIST: ${{ inputs.build_sdist }}
+          BUILD_WHEEL: ${{ inputs.build_wheel }}
+          DIST_DIRECTORY: ${{ inputs.dist_directory }}
+        run: |
+          python - << 'PY'
+          import os
+          import subprocess
+          import sys
+
+          build_sdist = os.environ["BUILD_SDIST"].lower() == "true"
+          build_wheel = os.environ["BUILD_WHEEL"].lower() == "true"
+          dist_directory = os.environ["DIST_DIRECTORY"]
+
+          if not build_sdist and not build_wheel:
+              raise SystemExit(
+                  "At least one of 'build_sdist' or 'build_wheel' must be true."
+              )
+
+          command = [sys.executable, "-m", "build", "--outdir", dist_directory]
+          if build_sdist:
+              command.append("--sdist")
+          if build_wheel:
+              command.append("--wheel")
+
+          subprocess.run(command, check=True)
+          PY
+
+      - name: Verify distribution metadata
+        if: ${{ inputs.verify_metadata }}
+        run: |
+          python -m twine check --strict ${{ inputs.dist_directory }}/*
+
+      - name: Smoke-install built distribution
+        if: ${{ inputs.verify_install }}
+        env:
+          DIST_DIRECTORY: ${{ inputs.dist_directory }}
+          PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
+        run: |
+          python - << 'PY'
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          dist_directory = Path(os.environ["DIST_DIRECTORY"])
+          wheel_candidates = sorted(dist_directory.glob("*.whl"))
+          sdist_candidates = sorted(dist_directory.glob("*.tar.gz"))
+
+          if wheel_candidates:
+              install_target = wheel_candidates[0]
+          elif sdist_candidates:
+              install_target = sdist_candidates[0]
+          else:
+              raise SystemExit(
+                  f"No built distributions found in {dist_directory}"
+              )
+
+          with tempfile.TemporaryDirectory() as venv_dir:
+              subprocess.run(
+                  [sys.executable, "-m", "venv", venv_dir],
+                  check=True,
+              )
+
+              if os.name == "nt":
+                  python_bin = Path(venv_dir) / "Scripts" / "python.exe"
+              else:
+                  python_bin = Path(venv_dir) / "bin" / "python"
+
+              subprocess.run(
+                  [str(python_bin), "-m", "pip", "install", "--upgrade", "pip"],
+                  check=True,
+              )
+              subprocess.run(
+                  [str(python_bin), "-m", "pip", "install", str(install_target)],
+                  check=True,
+              )
+              subprocess.run(
+                  [
+                      str(python_bin),
+                      "-c",
+                      (
+                          "from importlib import metadata; "
+                          "print(metadata.version("
+                          + repr(os.environ["PACKAGE_NAME"])
+                          + "))"
+                      ),
+                  ],
+                  check=True,
+              )
+          PY
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.working_directory }}/${{ inputs.dist_directory }}/*
+          if-no-files-found: error
+
+  publish:
+    if: ${{ inputs.publish }}
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Ensure package index token is configured
+        env:
+          PACKAGE_INDEX_API_TOKEN: ${{ secrets.PACKAGE_INDEX_API_TOKEN }}
+        run: |
+          if [ -z "${PACKAGE_INDEX_API_TOKEN}" ]; then
+            echo "::error::PACKAGE_INDEX_API_TOKEN is required for reusable publishing workflows."
+            echo "::error::Trusted Publishing via OIDC is not currently supported inside reusable workflows."
+            exit 1
+          fi
+
+      - name: Download distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.working_directory }}/${{ inputs.dist_directory }}
+
+      - name: Publish distributions to PyPI
+        if: ${{ inputs.repository_url == '' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PACKAGE_INDEX_API_TOKEN }}
+          packages-dir: ${{ inputs.working_directory }}/${{ inputs.dist_directory }}
+          skip-existing: ${{ inputs.skip_existing }}
+
+      - name: Publish distributions to custom index
+        if: ${{ inputs.repository_url != '' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PACKAGE_INDEX_API_TOKEN }}
+          packages-dir: ${{ inputs.working_directory }}/${{ inputs.dist_directory }}
+          repository-url: ${{ inputs.repository_url }}
+          skip-existing: ${{ inputs.skip_existing }}
+
+  github_release:
+    if: >-
+      ${{
+        always() &&
+        inputs.create_github_release &&
+        needs.build.result == 'success' &&
+        (!inputs.publish || needs.publish.result == 'success')
+      }}
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag_name }}
+          RELEASE_NAME: ${{ inputs.github_release_name }}
+          PACKAGE_NAME: ${{ needs.build.outputs.package_name }}
+          PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if [ -z "$RELEASE_NAME" ]; then
+            RELEASE_NAME="${PACKAGE_NAME} ${PACKAGE_VERSION}"
+          fi
+
+          gh release create \
+            "$RELEASE_TAG" \
+            dist/* \
+            --title "$RELEASE_NAME" \
+            --generate-notes \
+            --verify-tag
