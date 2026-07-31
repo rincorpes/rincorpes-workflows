@@ -672,6 +672,8 @@ jobs:
           git pull origin "$STABLE_BRANCH"
 
           git revert --no-edit "$RELEASE_REF"
+          git restore --source="$RELEASE_REF" --staged --worktree -- pyproject.toml
+          git commit --amend --no-edit
           git push origin "$STABLE_BRANCH"
 
           if git ls-remote --tags origin "$TAG_NAME" | grep -q "$TAG_NAME"; then

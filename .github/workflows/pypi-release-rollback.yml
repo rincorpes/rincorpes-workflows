@@ -260,9 +260,13 @@ jobs:
           fi
 
       - name: Revert release commit
+        env:
+          RELEASE_COMMIT: ${{ steps.validate.outputs.release_commit }}
         working-directory: target-repo
         run: |
           git revert --no-edit HEAD
+          git restore --source="$RELEASE_COMMIT" --staged --worktree -- pyproject.toml
+          git commit --amend --no-edit
 
       - name: Push rollback commit
         id: rollback_commit
