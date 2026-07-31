@@ -3,6 +3,13 @@ name: Reusable PyPI Release
 on:
   workflow_call:
     inputs:
+      bump_type:
+        required: true
+        type: string
+      stable_branch:
+        required: false
+        type: string
+        default: "main"
       working_directory:
         required: false
         type: string
@@ -11,7 +18,11 @@ on:
         required: false
         type: string
         default: "3.12"
-      package_name:
+      changelog_file:
+        required: false
+        type: string
+        default: "CHANGELOG.md"
+      tag_prefix:
         required: false
         type: string
         default: ""
@@ -47,10 +58,6 @@ on:
         required: false
         type: boolean
         default: true
-      publish:
-        required: false
-        type: boolean
-        default: true
       repository_url:
         required: false
         type: string
@@ -59,69 +66,357 @@ on:
         required: false
         type: boolean
         default: false
-      tag_prefix:
-        required: false
-        type: string
-        default: "v"
-      tag_name:
-        required: false
-        type: string
-        default: ""
-      verify_tag_matches_version:
-        required: false
-        type: boolean
-        default: false
       create_github_release:
         required: false
         type: boolean
-        default: false
+        default: true
       github_release_name:
         required: false
         type: string
         default: ""
     secrets:
       PACKAGE_INDEX_API_TOKEN:
+        required: true
+      SLACK_BOT_TOKEN:
         required: false
-    outputs:
-      package_name:
-        description: Resolved package name from input or pyproject metadata.
-        value: ${{ jobs.build.outputs.package_name }}
-      version:
-        description: Resolved package version from pyproject metadata.
-        value: ${{ jobs.build.outputs.version }}
-      tag_name:
-        description: Resolved release tag name.
-        value: ${{ jobs.build.outputs.tag_name }}
-      release_ref:
-        description: Git commit SHA used for the release build.
-        value: ${{ jobs.build.outputs.release_ref }}
+      SLACK_CHANNEL_ID_RELEASE:
+        required: false
+      DISCORD_WEBHOOK_URL_RELEASE:
+        required: false
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: pypi-release-${{ github.repository }}-${{ inputs.working_directory }}
   cancel-in-progress: false
 
 jobs:
-  build:
+  prepare_release:
     runs-on: ubuntu-latest
     outputs:
-      package_name: ${{ steps.metadata.outputs.package_name }}
-      version: ${{ steps.metadata.outputs.version }}
-      tag_name: ${{ steps.metadata.outputs.tag_name }}
-      release_ref: ${{ steps.metadata.outputs.release_ref }}
+      package_name: ${{ steps.prepare.outputs.package_name }}
+      version: ${{ steps.prepare.outputs.version }}
+      tag_name: ${{ steps.prepare.outputs.tag_name }}
+      release_ref: ${{ steps.release_ref.outputs.release_ref }}
+      changelog_section: ${{ steps.prepare.outputs.changelog_section }}
+      start_unix: ${{ steps.start.outputs.start_unix }}
 
     defaults:
       run:
         working-directory: ${{ inputs.working_directory }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Mark start time
+        id: start
+        run: echo "start_unix=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout stable branch
+        uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.stable_branch }}
           fetch-depth: 0
-          persist-credentials: false
+
+      - name: Set up Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.working_directory }}/pyproject.toml
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch branches and tags
+        run: |
+          git fetch origin "${{ inputs.stable_branch }}" --tags
+
+      - name: Ensure stable branch is current
+        run: |
+          git checkout "${{ inputs.stable_branch }}"
+          git pull origin "${{ inputs.stable_branch }}"
+
+      - name: Bump version and update changelog
+        id: prepare
+        env:
+          BUMP_TYPE: ${{ inputs.bump_type }}
+          CHANGELOG_FILE: ${{ inputs.changelog_file }}
+          TAG_PREFIX_OVERRIDE: ${{ inputs.tag_prefix }}
+        run: |
+          set -e
+
+          python - << 'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import re
+          import subprocess
+          from datetime import date
+          from pathlib import Path
+
+          try:
+              import tomllib
+          except ModuleNotFoundError:  # pragma: no cover
+              import tomli as tomllib  # type: ignore
+
+          bump_type = os.environ["BUMP_TYPE"].strip().lower()
+          if bump_type not in {"major", "minor", "patch"}:
+              raise SystemExit(f"Unsupported bump_type: {bump_type}")
+
+          pyproject_path = Path("pyproject.toml")
+          changelog_path = Path(os.environ["CHANGELOG_FILE"])
+
+          if not pyproject_path.exists():
+              raise SystemExit("pyproject.toml not found in working directory")
+
+          pyproject_text = pyproject_path.read_text(encoding="utf-8")
+          pyproject_data = tomllib.loads(pyproject_text)
+          project_data = pyproject_data.get("project", {})
+          poetry_data = pyproject_data.get("tool", {}).get("poetry", {})
+
+          package_name = str(
+              project_data.get("name") or poetry_data.get("name") or ""
+          ).strip()
+          if not package_name:
+              raise SystemExit("Unable to resolve package name from pyproject.toml")
+
+          parsed_project_version = project_data.get("version")
+          parsed_poetry_version = poetry_data.get("version")
+
+          current_versions = [
+              str(value).strip()
+              for value in (parsed_project_version, parsed_poetry_version)
+              if value
+          ]
+          if not current_versions:
+              raise SystemExit("Unable to resolve current version from pyproject.toml")
+
+          if len(set(current_versions)) != 1:
+              raise SystemExit(
+                  "Version mismatch between [project] and [tool.poetry]: "
+                  + ", ".join(current_versions)
+              )
+
+          current_version = current_versions[0]
+          version_match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", current_version)
+          if not version_match:
+              raise SystemExit(
+                  f"Unsupported version format '{current_version}'. Expected x.y.z."
+              )
+
+          major, minor, patch = map(int, version_match.groups())
+          if bump_type == "major":
+              major += 1
+              minor = 0
+              patch = 0
+          elif bump_type == "minor":
+              minor += 1
+              patch = 0
+          else:
+              patch += 1
+
+          new_version = f"{major}.{minor}.{patch}"
+
+          tag_prefix = os.environ["TAG_PREFIX_OVERRIDE"].strip()
+          if not tag_prefix:
+              tag_prefix = f"{package_name}-v"
+          tag_name = f"{tag_prefix}{new_version}"
+
+          existing_tag = subprocess.check_output(
+              ["git", "tag", "--list", tag_name],
+              text=True,
+          ).strip()
+          if existing_tag:
+              raise SystemExit(f"Tag '{tag_name}' already exists.")
+
+          def replace_version_in_section(
+              text: str,
+              section_name: str,
+              new_value: str,
+          ) -> tuple[str, int]:
+              lines = text.splitlines(keepends=True)
+              in_target_section = False
+              replacements = 0
+
+              for index, raw_line in enumerate(lines):
+                  stripped = raw_line.strip()
+                  if stripped.startswith("[") and stripped.endswith("]"):
+                      in_target_section = stripped == f"[{section_name}]"
+                      continue
+
+                  if in_target_section and re.match(r'^version\s*=\s*".*"$', stripped):
+                      newline = "\n" if raw_line.endswith("\n") else ""
+                      lines[index] = f'version = "{new_value}"{newline}'
+                      replacements += 1
+                      in_target_section = False
+
+              return "".join(lines), replacements
+
+          updated_text = pyproject_text
+          total_replacements = 0
+          for section_name in ("project", "tool.poetry"):
+              updated_text, replacements = replace_version_in_section(
+                  updated_text,
+                  section_name,
+                  new_version,
+              )
+              total_replacements += replacements
+
+          if total_replacements == 0:
+              raise SystemExit("Failed to update version in pyproject.toml")
+
+          pyproject_path.write_text(updated_text, encoding="utf-8")
+
+          if changelog_path.exists():
+              old_changelog = changelog_path.read_text(encoding="utf-8")
+          else:
+              old_changelog = (
+                  "# Changelog\n\n"
+                  "All notable changes to this project will be documented in this file.\n\n"
+                  "This project adheres to [Semantic Versioning](https://semver.org/).\n\n"
+                  "## [Unreleased]\n\n"
+              )
+
+          tags = subprocess.check_output(
+              ["git", "tag", "--list", f"{tag_prefix}*", "--sort=-v:refname"],
+              text=True,
+          ).splitlines()
+          previous_tag = tags[0].strip() if tags else None
+
+          log_command = ["git", "log", "--pretty=format:%s"]
+          if previous_tag:
+              log_command.insert(2, f"{previous_tag}..HEAD")
+          log_command.extend(["--", "."])
+          raw_log = subprocess.check_output(log_command, text=True)
+          subjects = [line.strip() for line in raw_log.splitlines() if line.strip()]
+
+          conventional_re = re.compile(
+              r"^(?P<type>[A-Za-z]+)(?:\([^)]+\))?(?P<bang>!)?:\s*(?P<message>.+)$"
+          )
+          type_to_section = {
+              "feat": "Added",
+              "fix": "Fixed",
+              "refactor": "Changed",
+              "perf": "Changed",
+              "docs": "Changed",
+              "style": "Changed",
+              "build": "Changed",
+              "test": "Changed",
+              "ci": "Changed",
+              "chore": "Changed",
+          }
+          sections = {"Added": [], "Fixed": [], "Changed": []}
+          other = []
+
+          for subject in subjects:
+              lower_subject = subject.lower()
+              if lower_subject.startswith("chore(release):"):
+                  continue
+
+              match = conventional_re.match(subject)
+              if not match:
+                  other.append(f"- {subject}")
+                  continue
+
+              commit_type = match.group("type").lower()
+              message = match.group("message").strip()
+              bang = match.group("bang")
+              heading = type_to_section.get(commit_type)
+
+              if bang and heading != "Added":
+                  sections["Changed"].append(f"- {message} (breaking)")
+                  continue
+
+              if heading:
+                  sections[heading].append(f"- {message}")
+              else:
+                  other.append(f"- {subject}")
+
+          today = date.today().isoformat()
+          header = f"## [{new_version}] - {today}"
+
+          if not any(sections.values()) and not other:
+              body = "- Internal changes only."
+          else:
+              parts: list[str] = []
+              for heading in ("Added", "Fixed", "Changed"):
+                  entries = sections[heading]
+                  if entries:
+                      parts.append(f"### {heading}")
+                      parts.extend(entries)
+                      parts.append("")
+              if other:
+                  parts.append("### Other")
+                  parts.extend(other)
+                  parts.append("")
+              body = "\n".join(parts).strip()
+
+          new_section = f"{header}\n\n{body}\n"
+
+          unreleased_match = re.search(
+              r"^## \[Unreleased\].*$",
+              old_changelog,
+              flags=re.MULTILINE,
+          )
+          if unreleased_match:
+              start_after = unreleased_match.end()
+              rest = old_changelog[start_after:]
+              next_header = re.search(r"^## \[.*\]", rest, flags=re.MULTILINE)
+              if next_header:
+                  insert_pos = start_after + next_header.start()
+              else:
+                  insert_pos = len(old_changelog)
+          else:
+              insert_pos = len(old_changelog.rstrip())
+
+          before = old_changelog[:insert_pos].rstrip("\n")
+          after = old_changelog[insert_pos:].lstrip("\n")
+          new_changelog = before + "\n\n" + new_section + "\n" + after
+          changelog_path.write_text(new_changelog.rstrip() + "\n", encoding="utf-8")
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as output_file:
+              output_file.write(f"package_name={package_name}\n")
+              output_file.write(f"version={new_version}\n")
+              output_file.write(f"tag_name={tag_name}\n")
+              output_file.write(
+                  f"changelog_section={json.dumps(new_section.strip())}\n"
+              )
+          PY
+
+      - name: Commit release changes
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+          PACKAGE_NAME: ${{ steps.prepare.outputs.package_name }}
+          CHANGELOG_FILE: ${{ inputs.changelog_file }}
+        run: |
+          set -e
+          git add pyproject.toml "$CHANGELOG_FILE"
+          git commit -m "chore(release): ${PACKAGE_NAME} v${VERSION}"
+          git push origin "${{ inputs.stable_branch }}"
+
+      - name: Resolve release ref
+        id: release_ref
+        run: |
+          echo "release_ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [prepare_release]
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare_release.outputs.release_ref }}
+          fetch-depth: 0
 
       - name: Install system dependencies (apt)
         if: ${{ inputs.apt_deps != '' }}
@@ -163,86 +458,6 @@ jobs:
                   check=True,
               )
           PY
-
-      - name: Resolve package metadata
-        id: metadata
-        env:
-          PACKAGE_NAME_OVERRIDE: ${{ inputs.package_name }}
-          TAG_NAME_OVERRIDE: ${{ inputs.tag_name }}
-          TAG_PREFIX: ${{ inputs.tag_prefix }}
-        run: |
-          python - << 'PY'
-          import os
-          import subprocess
-          from pathlib import Path
-
-          try:
-              import tomllib
-          except ModuleNotFoundError:  # pragma: no cover
-              import tomli as tomllib  # type: ignore
-
-          pyproject_path = Path("pyproject.toml")
-          if not pyproject_path.exists():
-              raise SystemExit(
-                  f"pyproject.toml not found in {Path.cwd()}"
-              )
-
-          data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
-          project = data.get("project", {})
-          poetry = data.get("tool", {}).get("poetry", {})
-
-          package_name = (
-              os.environ["PACKAGE_NAME_OVERRIDE"].strip()
-              or str(project.get("name") or poetry.get("name") or "").strip()
-          )
-          version = str(
-              project.get("version") or poetry.get("version") or ""
-          ).strip()
-
-          if not package_name:
-              raise SystemExit(
-                  "Unable to resolve package name. Set the workflow "
-                  "input 'package_name' or declare project metadata."
-              )
-
-          if not version:
-              raise SystemExit(
-                  "Unable to resolve package version from pyproject metadata."
-              )
-
-          tag_name = (
-              os.environ["TAG_NAME_OVERRIDE"].strip()
-              or f'{os.environ["TAG_PREFIX"]}{version}'
-          )
-          release_ref = subprocess.check_output(
-              ["git", "rev-parse", "HEAD"],
-              text=True,
-          ).strip()
-
-          output_path = Path(os.environ["GITHUB_OUTPUT"])
-          with output_path.open("a", encoding="utf-8") as output_file:
-              output_file.write(f"package_name={package_name}\n")
-              output_file.write(f"version={version}\n")
-              output_file.write(f"tag_name={tag_name}\n")
-              output_file.write(f"release_ref={release_ref}\n")
-          PY
-
-      - name: Verify tag matches version
-        if: ${{ inputs.verify_tag_matches_version }}
-        env:
-          EXPECTED_TAG: ${{ steps.metadata.outputs.tag_name }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          GITHUB_REF_TYPE: ${{ github.ref_type }}
-        run: |
-          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            echo "::error::Expected a tag ref for this release, got '$GITHUB_REF_TYPE'."
-            exit 1
-          fi
-
-          if [ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]; then
-            echo "::error::Tag '$GITHUB_REF_NAME' does not match expected package tag '$EXPECTED_TAG'."
-            exit 1
-          fi
 
       - name: Install release tooling
         run: |
@@ -287,7 +502,7 @@ jobs:
         if: ${{ inputs.verify_install }}
         env:
           DIST_DIRECTORY: ${{ inputs.dist_directory }}
-          PACKAGE_NAME: ${{ steps.metadata.outputs.package_name }}
+          PACKAGE_NAME: ${{ needs.prepare_release.outputs.package_name }}
         run: |
           python - << 'PY'
           import os
@@ -315,11 +530,7 @@ jobs:
                   check=True,
               )
 
-              if os.name == "nt":
-                  python_bin = Path(venv_dir) / "Scripts" / "python.exe"
-              else:
-                  python_bin = Path(venv_dir) / "bin" / "python"
-
+              python_bin = Path(venv_dir) / "bin" / "python"
               subprocess.run(
                   [str(python_bin), "-m", "pip", "install", "--upgrade", "pip"],
                   check=True,
@@ -344,37 +555,11 @@ jobs:
           PY
 
       - name: Upload distributions
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
           path: ${{ inputs.working_directory }}/${{ inputs.dist_directory }}/*
           if-no-files-found: error
-
-  publish:
-    if: ${{ inputs.publish }}
-    needs: [build]
-    runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: ${{ inputs.working_directory }}
-
-    steps:
-      - name: Ensure package index token is configured
-        env:
-          PACKAGE_INDEX_API_TOKEN: ${{ secrets.PACKAGE_INDEX_API_TOKEN }}
-        run: |
-          if [ -z "${PACKAGE_INDEX_API_TOKEN}" ]; then
-            echo "::error::PACKAGE_INDEX_API_TOKEN is required for reusable publishing workflows."
-            echo "::error::Trusted Publishing via OIDC is not currently supported inside reusable workflows."
-            exit 1
-          fi
-
-      - name: Download distributions
-        uses: actions/download-artifact@v6
-        with:
-          name: ${{ inputs.artifact_name }}
-          path: ${{ inputs.working_directory }}/${{ inputs.dist_directory }}
 
       - name: Publish distributions to PyPI
         if: ${{ inputs.repository_url == '' }}
@@ -395,41 +580,355 @@ jobs:
           repository-url: ${{ inputs.repository_url }}
           skip-existing: ${{ inputs.skip_existing }}
 
-  github_release:
-    if: >-
-      ${{
-        always() &&
-        inputs.create_github_release &&
-        needs.build.result == 'success' &&
-        (!inputs.publish || needs.publish.result == 'success')
-      }}
-    needs: [build, publish]
+  tag_release:
+    needs: [prepare_release, publish]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare_release.outputs.release_ref }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push tag
+        env:
+          TAG_NAME: ${{ needs.prepare_release.outputs.tag_name }}
+        run: |
+          set -e
+          git fetch origin --tags
+
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag $TAG_NAME already exists"
+            exit 1
+          fi
+
+          git tag -a "$TAG_NAME" -m "$TAG_NAME"
+          git push origin "$TAG_NAME"
+
       - name: Download distributions
-        uses: actions/download-artifact@v6
+        if: ${{ inputs.create_github_release }}
+        uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
           path: dist
 
       - name: Create GitHub release
+        if: ${{ inputs.create_github_release }}
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.build.outputs.tag_name }}
-          RELEASE_NAME: ${{ inputs.github_release_name }}
-          PACKAGE_NAME: ${{ needs.build.outputs.package_name }}
-          PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+          TAG_NAME: ${{ needs.prepare_release.outputs.tag_name }}
+          PACKAGE_NAME: ${{ needs.prepare_release.outputs.package_name }}
+          VERSION: ${{ needs.prepare_release.outputs.version }}
+          CHANGELOG_SECTION_JSON: ${{ needs.prepare_release.outputs.changelog_section }}
+          RELEASE_NAME_OVERRIDE: ${{ inputs.github_release_name }}
         run: |
+          set -e
+
+          CHANGELOG_SECTION=$(printf '%s' "$CHANGELOG_SECTION_JSON" | jq -r .)
+          RELEASE_NAME="$RELEASE_NAME_OVERRIDE"
           if [ -z "$RELEASE_NAME" ]; then
-            RELEASE_NAME="${PACKAGE_NAME} ${PACKAGE_VERSION}"
+            RELEASE_NAME="${PACKAGE_NAME} ${VERSION}"
           fi
 
+          NOTES_FILE="$(mktemp)"
+          printf '%s\n' "$CHANGELOG_SECTION" > "$NOTES_FILE"
+
           gh release create \
-            "$RELEASE_TAG" \
+            "$TAG_NAME" \
             dist/* \
             --title "$RELEASE_NAME" \
-            --generate-notes \
+            --notes-file "$NOTES_FILE" \
             --verify-tag
+
+  rollback:
+    needs: [prepare_release, publish]
+    runs-on: ubuntu-latest
+    if: ${{ needs.prepare_release.result == 'success' && needs.publish.result != 'success' }}
+
+    outputs:
+      rolled_back: ${{ steps.status.outputs.rolled_back }}
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout stable branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.stable_branch }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Revert release commit and clean up tag
+        env:
+          RELEASE_REF: ${{ needs.prepare_release.outputs.release_ref }}
+          STABLE_BRANCH: ${{ inputs.stable_branch }}
+          TAG_NAME: ${{ needs.prepare_release.outputs.tag_name }}
+        run: |
+          set -e
+          git fetch origin "$STABLE_BRANCH" --tags
+          git checkout "$STABLE_BRANCH"
+          git pull origin "$STABLE_BRANCH"
+
+          git revert --no-edit "$RELEASE_REF"
+          git push origin "$STABLE_BRANCH"
+
+          if git ls-remote --tags origin "$TAG_NAME" | grep -q "$TAG_NAME"; then
+            git push origin ":refs/tags/$TAG_NAME"
+          fi
+
+      - name: Mark rollback status
+        id: status
+        run: |
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+
+  notify:
+    needs:
+      - prepare_release
+      - publish
+      - tag_release
+      - rollback
+    runs-on: ubuntu-latest
+    if: always()
+
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID_RELEASE: ${{ secrets.SLACK_CHANNEL_ID_RELEASE }}
+      DISCORD_WEBHOOK_URL_RELEASE: ${{ secrets.DISCORD_WEBHOOK_URL_RELEASE }}
+
+    steps:
+      - name: Calculate pipeline duration
+        id: duration
+        run: |
+          end=$(date +%s)
+          seconds=$((end - ${{ needs.prepare_release.outputs.start_unix }}))
+          if [ "$seconds" -lt 60 ]; then
+            formatted="${seconds}s"
+          elif [ "$seconds" -lt 3600 ]; then
+            minutes=$((seconds / 60)); secs=$((seconds % 60))
+            formatted="${minutes}m"; [ "$secs" -ne 0 ] && formatted="${formatted} ${secs}s"
+          else
+            hours=$((seconds / 3600)); minutes=$(((seconds % 3600) / 60))
+            formatted="${hours}h"; [ "$minutes" -ne 0 ] && formatted="${formatted} ${minutes}m"
+          fi
+          echo "time=${formatted}" >> "$GITHUB_OUTPUT"
+
+      - name: Set pipeline status icon
+        id: icon
+        run: |
+          if [[ "${{ needs.publish.result }}" != "success" || \
+                "${{ needs.tag_release.result }}" != "success" ]]; then
+            echo "icon=x" >> "$GITHUB_OUTPUT"
+          else
+            echo "icon=white_check_mark" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set pipeline status word
+        id: word
+        run: |
+          if [[ "${{ needs.publish.result }}" != "success" || \
+                "${{ needs.tag_release.result }}" != "success" ]]; then
+            echo "word=failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "word=passed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get GitHub user full name
+        id: ghname
+        run: |
+          name=$(curl -s "https://api.github.com/users/${{ github.actor }}" | jq -r '.name // empty')
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Build payload JSON
+        id: payload
+        env:
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+          BRANCH: ${{ inputs.stable_branch }}
+          COMMIT: ${{ needs.prepare_release.outputs.release_ref }}
+          DURATION: ${{ steps.duration.outputs.time }}
+          ICON: ${{ steps.icon.outputs.icon }}
+          WORD: ${{ steps.word.outputs.word }}
+          NAME: ${{ steps.ghname.outputs.name }}
+          PACKAGE_NAME: ${{ needs.prepare_release.outputs.package_name }}
+          VERSION: ${{ needs.prepare_release.outputs.version }}
+          TAG_NAME: ${{ needs.prepare_release.outputs.tag_name }}
+          CHANGELOG_SECTION_JSON: ${{ needs.prepare_release.outputs.changelog_section }}
+          ROLLBACK_RESULT: ${{ needs.rollback.result }}
+        run: |
+          CHANGELOG_SECTION=$(printf '%s' "$CHANGELOG_SECTION_JSON" | jq -r . 2>/dev/null || true)
+          if [ -z "$CHANGELOG_SECTION" ] || [ "$CHANGELOG_SECTION" = "null" ]; then
+            CHANGELOG_SECTION="Changelog section not available."
+          fi
+
+          if [ -n "${{ inputs.repository_url }}" ]; then
+            PACKAGE_LINK="${{ inputs.repository_url }}"
+          else
+            PACKAGE_LINK="https://pypi.org/project/${PACKAGE_NAME}/${VERSION}/"
+          fi
+
+          if [ "$ROLLBACK_RESULT" = "success" ]; then
+            ROLLBACK_LINE="Rollback commit pushed after publish failure."
+          elif [ "$ROLLBACK_RESULT" = "failure" ]; then
+            ROLLBACK_LINE="Rollback attempted but failed."
+          else
+            ROLLBACK_LINE="No rollback needed."
+          fi
+
+          blocks=$(jq -cn \
+            --arg icon "$ICON" \
+            --arg name "$NAME" \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPO" \
+            --arg runid "$RUN_ID" \
+            --arg actor "$ACTOR" \
+            --arg branch "$BRANCH" \
+            --arg commit "$COMMIT" \
+            --arg dur "$DURATION" \
+            --arg word "$WORD" \
+            --arg pkg "$PACKAGE_NAME" \
+            --arg version "$VERSION" \
+            --arg tag "$TAG_NAME" \
+            --arg pkgurl "$PACKAGE_LINK" \
+            --arg chlog "$CHANGELOG_SECTION" \
+            --arg rollback "$ROLLBACK_LINE" '
+            [
+              {
+                "type":"section",
+                "text":{
+                  "type":"mrkdwn",
+                  "text": (":\($icon): *PyPI release pipeline \((if ($name|length)>0 then $name else $actor end))* " +
+                          "(<\($server)/\($actor)|@\($actor)>)\n" +
+                          "Pipeline <\($server)/\($repo)/actions/runs/\($runid)|#\($runid)> has *\($word)* in `\($dur)`.")
+                }
+              },
+              {
+                "type":"section",
+                "fields":[
+                  { "type":"mrkdwn", "text":"*Branch:*\n<\($server)/\($repo)/tree/\($branch)|`\($branch)`>" },
+                  { "type":"mrkdwn", "text":"*Commit:*\n<\($server)/\($repo)/commit/\($commit)|`\($commit)`>" }
+                ]
+              },
+              {
+                "type":"section",
+                "text":{
+                  "type":"mrkdwn",
+                  "text":"*Package:* `\($pkg)`\n*Release:* `\($version)`\n*Tag:* <\($server)/\($repo)/tree/\($tag)|`\($tag)`>\n*Registry:* <\($pkgurl)|package page>"
+                }
+              },
+              {
+                "type":"section",
+                "text":{
+                  "type":"mrkdwn",
+                  "text":"*Changelog:*\n\($chlog)"
+                }
+              },
+              {
+                "type":"context",
+                "elements":[
+                  { "type":"mrkdwn", "text":"\($rollback)" }
+                ]
+              }
+            ]')
+
+          payload=$(jq -cn \
+            --arg icon "$ICON" \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPO" \
+            --arg runid "$RUN_ID" \
+            --arg word "$WORD" \
+            --arg dur "$DURATION" \
+            --arg pkg "$PACKAGE_NAME" \
+            --arg version "$VERSION" \
+            --argjson blocks "$blocks" '
+            {
+              "text": (":\($icon): PyPI release `" + $pkg + " " + $version + "` <\($server)/\($repo)/actions/runs/\($runid)|#\($runid)> has *\($word)* in `\($dur)`."),
+              "blocks": $blocks
+            }')
+
+          echo "payload=$(echo "$payload" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+      - name: Slack Notification
+        if: env.SLACK_BOT_TOKEN != '' && env.SLACK_CHANNEL_ID_RELEASE != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL_ID_RELEASE }}
+          payload: ${{ steps.payload.outputs.payload }}
+        env:
+          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
+
+      - name: Build Discord payload JSON
+        id: discord_payload
+        env:
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          PACKAGE_NAME: ${{ needs.prepare_release.outputs.package_name }}
+          VERSION: ${{ needs.prepare_release.outputs.version }}
+          TAG_NAME: ${{ needs.prepare_release.outputs.tag_name }}
+          WORD: ${{ steps.word.outputs.word }}
+          DURATION: ${{ steps.duration.outputs.time }}
+          BRANCH: ${{ inputs.stable_branch }}
+          COMMIT: ${{ needs.prepare_release.outputs.release_ref }}
+          ROLLBACK_RESULT: ${{ needs.rollback.result }}
+        run: |
+          if [ -n "${{ inputs.repository_url }}" ]; then
+            PACKAGE_LINK="${{ inputs.repository_url }}"
+          else
+            PACKAGE_LINK="https://pypi.org/project/${PACKAGE_NAME}/${VERSION}/"
+          fi
+
+          if [ "$ROLLBACK_RESULT" = "success" ]; then
+            ROLLBACK_LINE="Rollback commit pushed after publish failure."
+          elif [ "$ROLLBACK_RESULT" = "failure" ]; then
+            ROLLBACK_LINE="Rollback attempted but failed."
+          else
+            ROLLBACK_LINE="No rollback needed."
+          fi
+
+          payload=$(jq -cn \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPO" \
+            --arg runid "$RUN_ID" \
+            --arg pkg "$PACKAGE_NAME" \
+            --arg version "$VERSION" \
+            --arg tag "$TAG_NAME" \
+            --arg word "$WORD" \
+            --arg dur "$DURATION" \
+            --arg branch "$BRANCH" \
+            --arg commit "$COMMIT" \
+            --arg link "$PACKAGE_LINK" \
+            --arg rollback "$ROLLBACK_LINE" '
+            {
+              "content": ("Release `" + $pkg + " " + $version + "` " + $word + " in `" + $dur + "`\n" +
+                          "Run: " + $server + "/" + $repo + "/actions/runs/" + $runid + "\n" +
+                          "Branch: `" + $branch + "`\n" +
+                          "Commit: `" + $commit + "`\n" +
+                          "Tag: " + $server + "/" + $repo + "/tree/" + $tag + "\n" +
+                          "Registry: " + $link + "\n" +
+                          "Rollback: " + $rollback)
+            }')
+          echo "payload=$(echo "$payload" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+      - name: Discord Notification
+        if: env.DISCORD_WEBHOOK_URL_RELEASE != ''
+        env:
+          DISCORD_PAYLOAD: ${{ steps.discord_payload.outputs.payload }}
+        run: |
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            -d "$DISCORD_PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL_RELEASE"
