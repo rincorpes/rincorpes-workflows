@@ -364,6 +364,7 @@ jobs:
           if [ -z "$ROLLBACK_COMMIT" ]; then
             ROLLBACK_COMMIT="not created"
           fi
+          PYPI_MANAGE_URL="https://pypi.org/manage/project/${PACKAGE_NAME}/releases/"
 
           blocks=$(jq -cn \
             --arg icon "$ICON" \
@@ -382,7 +383,8 @@ jobs:
             --arg version "$VERSION" \
             --arg tag "$TAG_NAME" \
             --arg release_commit "$RELEASE_COMMIT" \
-            --arg rollback_commit "$ROLLBACK_COMMIT" '
+            --arg rollback_commit "$ROLLBACK_COMMIT" \
+            --arg pypi_manage_url "$PYPI_MANAGE_URL" '
             [
               {
                 "type":"section",
@@ -410,7 +412,7 @@ jobs:
               {
                 "type":"context",
                 "elements":[
-                  { "type":"mrkdwn", "text":"PyPI state is not automatically undone by this workflow. If the published version must be withdrawn, handle PyPI yanking or follow-up publishing separately." }
+                  { "type":"mrkdwn", "text":"PyPI state is not automatically undone by this workflow. Manage the release manually at <\($pypi_manage_url)|PyPI release management>." }
                 ]
               }
             ]')
@@ -456,6 +458,7 @@ jobs:
           RELEASE_COMMIT: ${{ needs.rollback_release.outputs.release_commit }}
           ROLLBACK_COMMIT: ${{ needs.rollback_release.outputs.rollback_commit }}
         run: |
+          PYPI_MANAGE_URL="https://pypi.org/manage/project/${PACKAGE_NAME}/releases/"
           payload=$(jq -cn \
             --arg server "$SERVER_URL" \
             --arg repo "$REPO" \
@@ -467,7 +470,8 @@ jobs:
             --arg version "$VERSION" \
             --arg tag "$TAG_NAME" \
             --arg release_commit "$RELEASE_COMMIT" \
-            --arg rollback_commit "$ROLLBACK_COMMIT" '
+            --arg rollback_commit "$ROLLBACK_COMMIT" \
+            --arg pypi_manage_url "$PYPI_MANAGE_URL" '
             {
               "content": ("Rollback for `" + $pkg + " " + $version + "` " + $word + " in `" + $dur + "`\n" +
                           "Run: " + $server + "/" + $repo + "/actions/runs/" + $runid + "\n" +
@@ -475,7 +479,7 @@ jobs:
                           "Tag: `" + $tag + "`\n" +
                           "Release commit: `" + $release_commit + "`\n" +
                           "Rollback commit: `" + $rollback_commit + "`\n" +
-                          "PyPI rollback is not automatic; yank manually if needed.")
+                          "PyPI release management: " + $pypi_manage_url)
             }')
           echo "payload=$(echo "$payload" | jq -c .)" >> "$GITHUB_OUTPUT"
 

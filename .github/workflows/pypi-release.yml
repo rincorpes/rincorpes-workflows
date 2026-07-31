@@ -294,22 +294,19 @@ jobs:
           subjects = [line.strip() for line in raw_log.splitlines() if line.strip()]
 
           conventional_re = re.compile(
-              r"^(?P<type>[A-Za-z]+)(?:\([^)]+\))?(?P<bang>!)?:\s*(?P<message>.+)$"
+              rf"^(?P<type>feat|refactor|fix|chore|docs)"
+              rf"\((?P<scope>{re.escape(package_name)})\)"
+              rf"(?P<bang>!)?:\s*(?P<message>.+)$",
+              re.IGNORECASE,
           )
           type_to_section = {
               "feat": "Added",
               "fix": "Fixed",
               "refactor": "Changed",
-              "perf": "Changed",
               "docs": "Changed",
-              "style": "Changed",
-              "build": "Changed",
-              "test": "Changed",
-              "ci": "Changed",
               "chore": "Changed",
           }
           sections = {"Added": [], "Fixed": [], "Changed": []}
-          other = []
 
           for subject in subjects:
               lower_subject = subject.lower()
@@ -318,7 +315,6 @@ jobs:
 
               match = conventional_re.match(subject)
               if not match:
-                  other.append(f"- {subject}")
                   continue
 
               commit_type = match.group("type").lower()
@@ -332,13 +328,11 @@ jobs:
 
               if heading:
                   sections[heading].append(f"- {message}")
-              else:
-                  other.append(f"- {subject}")
 
           today = date.today().isoformat()
           header = f"## [{new_version}] - {today}"
 
-          if not any(sections.values()) and not other:
+          if not any(sections.values()):
               body = "- Internal changes only."
           else:
               parts: list[str] = []
@@ -348,10 +342,6 @@ jobs:
                       parts.append(f"### {heading}")
                       parts.extend(entries)
                       parts.append("")
-              if other:
-                  parts.append("### Other")
-                  parts.extend(other)
-                  parts.append("")
               body = "\n".join(parts).strip()
 
           new_section = f"{header}\n\n{body}\n"
