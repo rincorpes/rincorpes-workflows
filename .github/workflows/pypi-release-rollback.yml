@@ -1,0 +1,469 @@
+name: Reusable PyPI Release Rollback
+
+on:
+  workflow_call:
+    inputs:
+      source_branch:
+        required: false
+        type: string
+        default: "main"
+      target_repository:
+        required: true
+        type: string
+      target_branch:
+        required: false
+        type: string
+        default: "main"
+      changelog_file:
+        required: false
+        type: string
+        default: "CHANGELOG.md"
+      tag_prefix:
+        required: false
+        type: string
+        default: ""
+      confirm_rollback:
+        required: true
+        type: boolean
+    secrets:
+      TARGET_REPOSITORY_TOKEN:
+        required: true
+      SLACK_BOT_TOKEN:
+        required: false
+      SLACK_CHANNEL_ID_RELEASE:
+        required: false
+      DISCORD_WEBHOOK_URL_RELEASE:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rollback-release-${{ inputs.target_repository }}
+  cancel-in-progress: false
+
+jobs:
+  rollback_release:
+    runs-on: ubuntu-latest
+    outputs:
+      package_name: ${{ steps.validate.outputs.package_name }}
+      version: ${{ steps.validate.outputs.version }}
+      tag_name: ${{ steps.validate.outputs.tag_name }}
+      target_repository: ${{ inputs.target_repository }}
+      target_branch: ${{ inputs.target_branch }}
+      release_commit: ${{ steps.validate.outputs.release_commit }}
+      rollback_commit: ${{ steps.rollback_commit.outputs.rollback_commit }}
+      start_unix: ${{ steps.start.outputs.start_unix }}
+
+    steps:
+      - name: Ensure workflow runs from allowed source branch
+        env:
+          CURRENT_REF: ${{ github.ref_name }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          if [ "$CURRENT_REF" != "$SOURCE_BRANCH" ]; then
+            echo "::error::This rollback workflow must be dispatched from '$SOURCE_BRANCH'."
+            exit 1
+          fi
+
+      - name: Require explicit confirmation
+        if: ${{ !inputs.confirm_rollback }}
+        run: |
+          echo "::error::Set confirm_rollback to true to execute this workflow."
+          exit 1
+
+      - name: Mark start time
+        id: start
+        run: echo "start_unix=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout public package repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repository }}
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.TARGET_REPOSITORY_TOKEN }}
+          path: target-repo
+
+      - name: Configure git
+        working-directory: target-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch branch and tags
+        working-directory: target-repo
+        run: |
+          git fetch origin "${{ inputs.target_branch }}" --tags
+          git checkout "${{ inputs.target_branch }}"
+          git pull origin "${{ inputs.target_branch }}"
+
+      - name: Validate rollback target
+        id: validate
+        working-directory: target-repo
+        env:
+          CHANGELOG_FILE: ${{ inputs.changelog_file }}
+          TAG_PREFIX_OVERRIDE: ${{ inputs.tag_prefix }}
+        run: |
+          python3 - << 'PY'
+          from __future__ import annotations
+
+          import os
+          import subprocess
+          from pathlib import Path
+
+          try:
+              import tomllib
+          except ModuleNotFoundError:  # pragma: no cover
+              import tomli as tomllib  # type: ignore
+
+          pyproject_path = Path("pyproject.toml")
+          changelog_path = Path(os.environ["CHANGELOG_FILE"])
+
+          if not pyproject_path.exists():
+              raise SystemExit("pyproject.toml not found in target repository")
+          if not changelog_path.exists():
+              raise SystemExit(
+                  f"Configured changelog file not found: {changelog_path}"
+              )
+
+          data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+          project = data.get("project", {})
+          poetry = data.get("tool", {}).get("poetry", {})
+
+          package_name = str(
+              project.get("name") or poetry.get("name") or ""
+          ).strip()
+          version = str(
+              project.get("version") or poetry.get("version") or ""
+          ).strip()
+
+          if not package_name:
+              raise SystemExit("Unable to resolve package name from pyproject.toml")
+          if not version:
+              raise SystemExit("Unable to resolve version from pyproject.toml")
+
+          tag_prefix = os.environ["TAG_PREFIX_OVERRIDE"].strip()
+          if not tag_prefix:
+              tag_prefix = f"{package_name}-v"
+          tag_name = f"{tag_prefix}{version}"
+
+          release_commit = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"],
+              text=True,
+          ).strip()
+          head_subject = subprocess.check_output(
+              ["git", "log", "-1", "--pretty=%s"],
+              text=True,
+          ).strip()
+
+          expected_subject = f"chore(release): {package_name} v{version}"
+          if head_subject != expected_subject:
+              raise SystemExit(
+                  "Rollback blocked because the latest commit is not the "
+                  f"release commit.\nExpected: {expected_subject}\n"
+                  f"Actual:   {head_subject}"
+              )
+
+          tags_at_head = {
+              line.strip()
+              for line in subprocess.check_output(
+                  ["git", "tag", "--points-at", "HEAD"],
+                  text=True,
+              ).splitlines()
+              if line.strip()
+          }
+          if tag_name not in tags_at_head:
+              raise SystemExit(
+                  "Rollback blocked because HEAD is not tagged with the "
+                  f"expected release tag '{tag_name}'."
+              )
+
+          changed_files = {
+              line.strip()
+              for line in subprocess.check_output(
+                  [
+                      "git",
+                      "diff-tree",
+                      "--no-commit-id",
+                      "--name-only",
+                      "-r",
+                      "HEAD",
+                  ],
+                  text=True,
+              ).splitlines()
+              if line.strip()
+          }
+
+          expected_files = {
+              "pyproject.toml",
+              str(changelog_path).replace("\\", "/"),
+          }
+          if changed_files != expected_files:
+              raise SystemExit(
+                  "Rollback blocked because the latest commit changed files "
+                  "other than the expected release files.\n"
+                  f"Expected: {sorted(expected_files)}\n"
+                  f"Actual:   {sorted(changed_files)}"
+              )
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as output_file:
+              output_file.write(f"package_name={package_name}\n")
+              output_file.write(f"version={version}\n")
+              output_file.write(f"tag_name={tag_name}\n")
+              output_file.write(f"release_commit={release_commit}\n")
+          PY
+
+      - name: Delete GitHub release when present
+        working-directory: target-repo
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPOSITORY_TOKEN }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          TAG_NAME: ${{ steps.validate.outputs.tag_name }}
+        run: |
+          if gh release view "$TAG_NAME" --repo "$TARGET_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG_NAME" --repo "$TARGET_REPOSITORY" --yes --cleanup-tag
+          else
+            echo "No GitHub release found for $TAG_NAME"
+          fi
+
+      - name: Delete tag when still present
+        working-directory: target-repo
+        env:
+          TAG_NAME: ${{ steps.validate.outputs.tag_name }}
+        run: |
+          git tag -d "$TAG_NAME" >/dev/null 2>&1 || true
+          if git ls-remote --tags origin "$TAG_NAME" | grep -q "$TAG_NAME"; then
+            git push origin ":refs/tags/$TAG_NAME"
+          fi
+
+      - name: Revert release commit
+        working-directory: target-repo
+        run: |
+          git revert --no-edit HEAD
+
+      - name: Push rollback commit
+        id: rollback_commit
+        working-directory: target-repo
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          git push origin "$TARGET_BRANCH"
+          echo "rollback_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  notify:
+    needs: [rollback_release]
+    runs-on: ubuntu-latest
+    if: always()
+
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID_RELEASE: ${{ secrets.SLACK_CHANNEL_ID_RELEASE }}
+      DISCORD_WEBHOOK_URL_RELEASE: ${{ secrets.DISCORD_WEBHOOK_URL_RELEASE }}
+
+    steps:
+      - name: Calculate pipeline duration
+        id: duration
+        run: |
+          start_unix="${{ needs.rollback_release.outputs.start_unix }}"
+          if [ -z "$start_unix" ]; then
+            start_unix=$(date +%s)
+          fi
+          end=$(date +%s)
+          seconds=$((end - start_unix))
+          if [ "$seconds" -lt 60 ]; then
+            formatted="${seconds}s"
+          elif [ "$seconds" -lt 3600 ]; then
+            minutes=$((seconds / 60)); secs=$((seconds % 60))
+            formatted="${minutes}m"; [ "$secs" -ne 0 ] && formatted="${formatted} ${secs}s"
+          else
+            hours=$((seconds / 3600)); minutes=$(((seconds % 3600) / 60))
+            formatted="${hours}h"; [ "$minutes" -ne 0 ] && formatted="${formatted} ${minutes}m"
+          fi
+          echo "time=${formatted}" >> "$GITHUB_OUTPUT"
+
+      - name: Set pipeline status icon
+        id: icon
+        run: |
+          if [[ "${{ needs.rollback_release.result }}" != "success" ]]; then
+            echo "icon=x" >> "$GITHUB_OUTPUT"
+          else
+            echo "icon=white_check_mark" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set pipeline status word
+        id: word
+        run: |
+          if [[ "${{ needs.rollback_release.result }}" != "success" ]]; then
+            echo "word=failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "word=passed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get GitHub user full name
+        id: ghname
+        run: |
+          name=$(curl -s "https://api.github.com/users/${{ github.actor }}" | jq -r '.name // empty')
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Build payload JSON
+        id: payload
+        env:
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          DURATION: ${{ steps.duration.outputs.time }}
+          ICON: ${{ steps.icon.outputs.icon }}
+          WORD: ${{ steps.word.outputs.word }}
+          NAME: ${{ steps.ghname.outputs.name }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PACKAGE_NAME: ${{ needs.rollback_release.outputs.package_name }}
+          VERSION: ${{ needs.rollback_release.outputs.version }}
+          TAG_NAME: ${{ needs.rollback_release.outputs.tag_name }}
+          RELEASE_COMMIT: ${{ needs.rollback_release.outputs.release_commit }}
+          ROLLBACK_COMMIT: ${{ needs.rollback_release.outputs.rollback_commit }}
+        run: |
+          if [ -z "$PACKAGE_NAME" ]; then
+            PACKAGE_NAME="unknown"
+          fi
+          if [ -z "$VERSION" ]; then
+            VERSION="unknown"
+          fi
+          if [ -z "$TAG_NAME" ]; then
+            TAG_NAME="unknown"
+          fi
+          if [ -z "$RELEASE_COMMIT" ]; then
+            RELEASE_COMMIT="unknown"
+          fi
+          if [ -z "$ROLLBACK_COMMIT" ]; then
+            ROLLBACK_COMMIT="not created"
+          fi
+
+          blocks=$(jq -cn \
+            --arg icon "$ICON" \
+            --arg name "$NAME" \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPO" \
+            --arg runid "$RUN_ID" \
+            --arg actor "$ACTOR" \
+            --arg branch "$BRANCH" \
+            --arg commit "$COMMIT" \
+            --arg dur "$DURATION" \
+            --arg word "$WORD" \
+            --arg target_repo "$TARGET_REPOSITORY" \
+            --arg target_branch "$TARGET_BRANCH" \
+            --arg pkg "$PACKAGE_NAME" \
+            --arg version "$VERSION" \
+            --arg tag "$TAG_NAME" \
+            --arg release_commit "$RELEASE_COMMIT" \
+            --arg rollback_commit "$ROLLBACK_COMMIT" '
+            [
+              {
+                "type":"section",
+                "text":{
+                  "type":"mrkdwn",
+                  "text": (":\($icon): *Manual rollback \((if ($name|length)>0 then $name else $actor end))* " +
+                          "(<\($server)/\($actor)|@\($actor)>)\n" +
+                          "Pipeline <\($server)/\($repo)/actions/runs/\($runid)|#\($runid)> has *\($word)* in `\($dur)`.")
+                }
+              },
+              {
+                "type":"section",
+                "fields":[
+                  { "type":"mrkdwn", "text":"*Monorepo branch:*\n<\($server)/\($repo)/tree/\($branch)|`\($branch)`>" },
+                  { "type":"mrkdwn", "text":"*Target repo:*\nhttps://github.com/\($target_repo)" }
+                ]
+              },
+              {
+                "type":"section",
+                "text":{
+                  "type":"mrkdwn",
+                  "text":"*Package:* `\($pkg)`\n*Version:* `\($version)`\n*Tag:* `\($tag)`\n*Target branch:* `\($target_branch)`\n*Release commit:* `\($release_commit)`\n*Rollback commit:* `\($rollback_commit)`"
+                }
+              },
+              {
+                "type":"context",
+                "elements":[
+                  { "type":"mrkdwn", "text":"PyPI state is not automatically undone by this workflow. If the published version must be withdrawn, handle PyPI yanking or follow-up publishing separately." }
+                ]
+              }
+            ]')
+
+          payload=$(jq -cn \
+            --arg icon "$ICON" \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPO" \
+            --arg runid "$RUN_ID" \
+            --arg word "$WORD" \
+            --arg dur "$DURATION" \
+            --arg pkg "$PACKAGE_NAME" \
+            --arg version "$VERSION" \
+            --argjson blocks "$blocks" '
+            {
+              "text": (":\($icon): Rollback for `" + $pkg + " " + $version + "` <\($server)/\($repo)/actions/runs/\($runid)|#\($runid)> has *\($word)* in `\($dur)`."),
+              "blocks": $blocks
+            }')
+
+          echo "payload=$(echo "$payload" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+      - name: Slack Notification
+        if: env.SLACK_BOT_TOKEN != '' && env.SLACK_CHANNEL_ID_RELEASE != ''
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL_ID_RELEASE }}
+          payload: ${{ steps.payload.outputs.payload }}
+        env:
+          SLACK_BOT_TOKEN: ${{ env.SLACK_BOT_TOKEN }}
+
+      - name: Build Discord payload JSON
+        id: discord_payload
+        env:
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WORD: ${{ steps.word.outputs.word }}
+          DURATION: ${{ steps.duration.outputs.time }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          PACKAGE_NAME: ${{ needs.rollback_release.outputs.package_name }}
+          VERSION: ${{ needs.rollback_release.outputs.version }}
+          TAG_NAME: ${{ needs.rollback_release.outputs.tag_name }}
+          RELEASE_COMMIT: ${{ needs.rollback_release.outputs.release_commit }}
+          ROLLBACK_COMMIT: ${{ needs.rollback_release.outputs.rollback_commit }}
+        run: |
+          payload=$(jq -cn \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPO" \
+            --arg runid "$RUN_ID" \
+            --arg word "$WORD" \
+            --arg dur "$DURATION" \
+            --arg target_repo "$TARGET_REPOSITORY" \
+            --arg pkg "$PACKAGE_NAME" \
+            --arg version "$VERSION" \
+            --arg tag "$TAG_NAME" \
+            --arg release_commit "$RELEASE_COMMIT" \
+            --arg rollback_commit "$ROLLBACK_COMMIT" '
+            {
+              "content": ("Rollback for `" + $pkg + " " + $version + "` " + $word + " in `" + $dur + "`\n" +
+                          "Run: " + $server + "/" + $repo + "/actions/runs/" + $runid + "\n" +
+                          "Target repo: https://github.com/" + $target_repo + "\n" +
+                          "Tag: `" + $tag + "`\n" +
+                          "Release commit: `" + $release_commit + "`\n" +
+                          "Rollback commit: `" + $rollback_commit + "`\n" +
+                          "PyPI rollback is not automatic; yank manually if needed.")
+            }')
+          echo "payload=$(echo "$payload" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+      - name: Discord Notification
+        if: env.DISCORD_WEBHOOK_URL_RELEASE != ''
+        env:
+          DISCORD_PAYLOAD: ${{ steps.discord_payload.outputs.payload }}
+        run: |
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            -d "$DISCORD_PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL_RELEASE"
