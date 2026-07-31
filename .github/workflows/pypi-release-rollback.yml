@@ -22,6 +22,9 @@ on:
         required: false
         type: string
         default: ""
+      expected_version:
+        required: true
+        type: string
       confirm_rollback:
         required: true
         type: boolean
@@ -72,12 +75,21 @@ jobs:
           echo "::error::Set confirm_rollback to true to execute this workflow."
           exit 1
 
+      - name: Ensure target repository token is configured
+        env:
+          TARGET_REPOSITORY_TOKEN: ${{ secrets.TARGET_REPOSITORY_TOKEN }}
+        run: |
+          if [ -z "${TARGET_REPOSITORY_TOKEN}" ]; then
+            echo "::error::TARGET_REPOSITORY_TOKEN is required and was not supplied."
+            exit 1
+          fi
+
       - name: Mark start time
         id: start
         run: echo "start_unix=$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout public package repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ inputs.target_repository }}
           ref: ${{ inputs.target_branch }}
@@ -104,6 +116,7 @@ jobs:
         env:
           CHANGELOG_FILE: ${{ inputs.changelog_file }}
           TAG_PREFIX_OVERRIDE: ${{ inputs.tag_prefix }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
         run: |
           python3 - << 'PY'
           from __future__ import annotations
@@ -142,6 +155,14 @@ jobs:
               raise SystemExit("Unable to resolve package name from pyproject.toml")
           if not version:
               raise SystemExit("Unable to resolve version from pyproject.toml")
+
+          expected_version = os.environ["EXPECTED_VERSION"].strip()
+          if version != expected_version:
+              raise SystemExit(
+                  "Rollback blocked because the current released version does "
+                  f"not match the requested version.\nExpected: {expected_version}\n"
+                  f"Actual:   {version}"
+              )
 
           tag_prefix = os.environ["TAG_PREFIX_OVERRIDE"].strip()
           if not tag_prefix:
